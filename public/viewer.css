@@ -1,0 +1,117 @@
+/* Neurora brand tokens — mirrors core/designsystem/theme/{Color,Theme}.kt
+   (LightColorScheme/DarkColorScheme) so this page reads as the same app,
+   not a separate skin. Light is the default and dark follows the system,
+   same as NeuroraTheme()'s isSystemInDarkTheme() default. */
+:root{
+  color-scheme:light dark;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
+  --primary:#6229B3;        /* NeuroraPurple */
+  --on-primary:#FFFFFF;
+  --secondary:#2BB19B;      /* NeuroraTeal */
+  --on-secondary:#FFFFFF;
+  --background:#F8FAFC;     /* NeuroraCanvas */
+  --on-background:#0D0E12;  /* NeuroraInk */
+  --surface:#FFFFFF;
+  --on-surface:#0D0E12;
+  --surface-variant:#F4F4F5;   /* NeuroraFieldFill */
+  --on-surface-variant:#6B7280;/* NeuroraSubtle */
+  --outline:#E5E7EB;           /* NeuroraFieldBorder */
+  --icon:#ACB5BB;               /* NeuroraIcon */
+  --error:#EF4444;              /* TagRed, RecordingScreen.kt */
+  --radius-button:14px;         /* MainPrimaryButton's RoundedCornerShape(14.dp) */
+  --radius-card:12px;
+  background:var(--background);
+  color:var(--on-background);
+}
+@media(prefers-color-scheme:dark){
+  :root{
+    /* Brand purple/teal stay AS-IS in dark — Theme.kt: "the dark design
+       does NOT brighten it". Only the neutrals shift, sampled from the
+       dark mockups (DarkColorScheme). */
+    --background:#0D0E12;      /* NeuroraDarkCanvas */
+    --on-background:#FFFFFF;
+    --surface:#1D1D1D;         /* NeuroraDarkSurface */
+    --on-surface:#FFFFFF;
+    --surface-variant:#20232B; /* NeuroraDarkSurfaceVariant */
+    --on-surface-variant:#CECECE;
+    --outline:#3D3D3D;         /* NeuroraDarkOutline */
+    --error:#FF383C;           /* dark-theme destructive red, Theme.kt */
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--background);color:var(--on-background)}
+main{max-width:1440px;margin:48px auto;padding:0 24px}
+header{display:flex;justify-content:space-between;align-items:center;margin-bottom:32px}
+.brand{font-size:12px;letter-spacing:.24em;color:var(--secondary);font-weight:700}
+h1{font-size:32px;margin:12px 0}
+p{color:var(--on-surface-variant);line-height:1.5;max-width:72ch}
+.badge{border:1px solid var(--secondary);color:var(--secondary);padding:8px 12px;border-radius:30px;font-size:11px;letter-spacing:.12em}
+label{display:block;font-size:13px;margin-bottom:8px}
+.controls{display:flex;gap:12px}
+input{background:var(--surface-variant);border:1px solid var(--outline);color:var(--on-surface);border-radius:8px;padding:12px 14px;font:inherit;min-width:0;width:280px}
+button{border:0;border-radius:var(--radius-button);background:var(--primary);color:var(--on-primary);padding:12px 18px;font:600 14px system-ui;cursor:pointer}
+.secondary{background:transparent;color:var(--on-surface);border:1px solid var(--outline)}
+button:disabled{opacity:.5;cursor:default}
+[hidden]{display:none!important}
+#status{font-size:14px;min-height:24px;color:var(--on-surface-variant)}
+.screen{aspect-ratio:16/9;max-height:78vh;background:#020507;border:1px solid var(--outline);border-radius:var(--radius-card);position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center}
+video{width:100%;height:100%;object-fit:contain}
+#empty{position:absolute;color:#73899d;pointer-events:none;font-size:14px}
+footer{display:flex;justify-content:space-between;align-items:center;margin-top:16px;gap:12px}
+#quality,.note{font-size:12px;color:var(--on-surface-variant)}
+.note{margin-top:24px}
+.tagbar{display:flex;align-items:center;gap:12px;margin-top:16px}
+.clock{font:700 20px/1 system-ui;font-variant-numeric:tabular-nums;min-width:64px;color:var(--on-background)}
+/* The app's "+ Add Tag" orb gradient (PlusGradientTop/Bottom, RecordingScreen.kt). */
+#tag{background:linear-gradient(180deg,#906AE5,#5524C6);color:#fff}
+#tag:disabled{opacity:.5;cursor:default}
+#tagCount{font-size:12px;color:var(--on-surface-variant)}
+.tag-list{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:6px;max-height:220px;overflow-y:auto}
+.tag-list li{display:flex;align-items:center;gap:10px;font-size:13px;padding:8px 10px;background:var(--surface-variant);border-radius:8px;border:1px solid var(--outline)}
+.tag-dot{width:10px;height:10px;border-radius:50%;flex:none}
+.tag-name{flex:1;color:var(--on-surface)}
+.tag-time{font-variant-numeric:tabular-nums;color:var(--on-surface-variant)}
+@media(max-width:600px){main{margin:24px auto;padding:0 16px}header{align-items:flex-start}.badge{margin-top:6px}h1{font-size:27px}.controls{flex-wrap:wrap}input{flex:1;width:auto}.screen{border-radius:8px}.tagbar{flex-wrap:wrap}}
+
+/* ---------------------------------------------------------------- gaze dot
+   The remote twin of the phone's own reticle (VideoReticle in
+   RecordingScreen.kt), drawn in GazePink so the two screens read as the same
+   overlay. Positioned by a transform from the top-left of .screen — viewer.js
+   does the object-fit:contain math — so it tracks the picture rather than the
+   box, and pointer-events:none keeps it off the <video> element's controls. */
+.gaze{position:absolute;left:0;top:0;width:18px;height:18px;border-radius:50%;
+  background:#E0218A;border:2px solid rgba(255,255,255,.9);
+  box-shadow:0 0 0 1px rgba(0,0,0,.35),0 0 10px rgba(224,33,138,.55);
+  pointer-events:none;will-change:transform;
+  /* Just long enough to smooth the ~25 Hz sample rate into continuous
+     motion. Anything slower reads as the dot lagging the eye. */
+  transition:transform 60ms linear}
+@media(prefers-reduced-motion:reduce){.gaze{transition:none}}
+/* The one tap that turns sound on when the browser's autoplay policy refused
+   an audible start — see startPlayback() in viewer.js. */
+.unmute{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);
+  background:rgba(13,14,18,.82);color:#fff;border:1px solid rgba(255,255,255,.35);
+  border-radius:30px;padding:10px 16px;font:600 13px system-ui;backdrop-filter:blur(4px)}
+.viewers{font-size:12px;color:var(--on-surface-variant);white-space:nowrap}
+.toggle{display:inline-flex;align-items:center;gap:6px;margin:0;font-size:13px;
+  color:var(--on-surface-variant);cursor:pointer}
+.toggle input{accent-color:var(--primary);cursor:pointer}
+
+/* The session audio element. Every UA stylesheet already hides an <audio>
+   with no controls attribute; stated here so a future change to that markup
+   cannot put a stray player in the middle of the page. */
+audio{display:none}
+/* "LIVE", over the top-left of the picture. The video element has no
+   controls (there is nothing to seek and pausing a live session only
+   desynchronises the viewer), so this is what tells you the feed is
+   current rather than a stalled last frame. */
+.live{position:absolute;top:12px;left:12px;display:flex;align-items:center;gap:7px;
+  background:rgba(13,14,18,.72);color:#fff;border-radius:30px;padding:5px 12px 5px 10px;
+  font:700 11px/1 system-ui;letter-spacing:.12em;pointer-events:none;backdrop-filter:blur(4px)}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--error);animation:live-pulse 2s ease-in-out infinite}
+@keyframes live-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media(prefers-reduced-motion:reduce){.live-dot{animation:none}}
+/* Sound on/off, in the tag bar: with the video's own controls gone this is
+   the only place left to silence the session. */
+.toggle-btn{padding:10px 14px;font:600 13px system-ui}
+.toggle-btn[aria-pressed="true"]{color:var(--on-surface-variant)}

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="theme-color" content="#6229B3"><title>Neurora Remote View</title><link rel="stylesheet" href="/viewer.css"></head>
+<body><main><header><div><span class="brand">NEURORA</span><h1>Remote view</h1><p>Watch the scene video, hear the session, and follow the gaze point from your recording session.</p></div><span class="badge">VIDEO · AUDIO · GAZE</span></header>
+<form id="join-form"><label for="room">Session code</label><div class="controls"><input id="room" name="room" placeholder="SES-7ABC" maxlength="96" pattern="[A-Za-z0-9_-]{3,96}" required autocomplete="off" spellcheck="false"><button id="join" type="submit">Watch session</button><button id="leave" type="button" class="secondary" hidden>Disconnect</button></div></form>
+<p id="status" role="status">Enter the session code shown on the phone.</p>
+<!-- No `controls` on the video: this is a live feed, so a scrub bar leads
+     nowhere and a pause button only desynchronises the viewer from the
+     session that is still going on. The LIVE badge says so, and sound is
+     handled by the separate element below. -->
+<section class="screen" aria-label="Live scene video"><video id="video" autoplay playsinline muted></video><div id="gaze" class="gaze" hidden aria-hidden="true"></div><span id="live" class="live" hidden><span class="live-dot" aria-hidden="true"></span>LIVE</span><div id="empty">Your live video will appear here.</div><button id="unmute" type="button" class="unmute" hidden>Tap for sound</button></section>
+<!-- The session audio plays here, NOT through the video element. A media
+     element will not start playback until its video track has produced a
+     frame, and the phone's scene decoder deliberately waits several seconds
+     for the glasses' pipeline to settle - so audio sharing the video element
+     stayed silent for that whole window. See viewer.js. -->
+<audio id="sound" autoplay></audio>
+<section class="tagbar" id="tagbar" hidden><span id="clock" class="clock">00:00</span><button id="tag" type="button">+ Add Tag</button><span id="tagCount"></span><button id="mute" type="button" class="secondary toggle-btn" aria-pressed="false" hidden>Sound on</button><label class="toggle"><input id="gazeToggle" type="checkbox" checked> Gaze</label></section>
+<ul id="tagList" class="tag-list" hidden aria-label="Tagged moments"></ul>
+<footer><span id="quality">Waiting for video</span><span id="viewers" class="viewers"></span><button id="copy" type="button" class="secondary">Copy viewer link</button></footer>
+<p class="note">Keep the recording phone online. Up to five people can watch the same session code at once.</p>
+</main><script src="/viewer.js" defer></script></body></html>
