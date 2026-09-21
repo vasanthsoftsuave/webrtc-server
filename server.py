@@ -19,6 +19,8 @@ Protocol 3 (was 2):
   negotiate a transport neither peer reads.
 - `gaze` (publisher -> every viewer) carries the scene-normalised gaze point
   so the browser can draw the same reticle the phone draws.
+- `tag-request` and `stop-request` (any viewer -> publisher) drive the
+  phone's own tag and stop controls from the browser.
 """
 
 from __future__ import annotations
@@ -765,11 +767,15 @@ def create_server(
                 )
             elif msg_type == "candidate":
                 await relay_candidate(msg, room.publisher, mine.session)
-            elif msg_type == "tag-request":
-                # The web "Tag" button asking the phone to create a real tag,
-                # same as its own "+" control. Any of the viewers may ask, and
-                # the session tells the phone which one did.
-                await send(room.publisher, {"type": "tag-request", "session": mine.session})
+            elif msg_type in ("tag-request", "stop-request"):
+                # The web "Tag" and "Stop" buttons asking the phone to do what
+                # its own controls do. Any viewer may ask, and the session
+                # tells the phone which one did.
+                #
+                # Relayed, never acted on: this server does not know whether a
+                # recording is even running, so a stop for one that already
+                # ended has to be the phone's no-op rather than an error here.
+                await send(room.publisher, {"type": msg_type, "session": mine.session})
 
         async def on_message(raw: str | bytes) -> None:
             try:

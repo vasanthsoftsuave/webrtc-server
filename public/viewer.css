@@ -115,3 +115,10 @@ audio{display:none}
    the only place left to silence the session. */
 .toggle-btn{padding:10px 14px;font:600 13px system-ui}
 .toggle-btn[aria-pressed="true"]{color:var(--on-surface-variant)}
+
+/* Stop, in the tag bar next to "+ Add Tag". Destructive and irreversible
+   from here, so it is the only red control on the page and it arms before
+   it fires (see stopBtn.onclick in viewer.js). */
+.stop{background:transparent;color:var(--error);border:1px solid var(--error)}
+.stop:disabled{opacity:.4;cursor:default}
+.stop.armed{background:var(--error);color:#fff;border-color:var(--error)}

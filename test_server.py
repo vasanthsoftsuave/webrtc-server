@@ -441,6 +441,32 @@ async def test_tag_request_relays_viewer_taps_to_the_publisher_only(app):
     ), "tag-request echoed back to the viewer"
 
 
+async def test_stop_request_reaches_the_publisher_and_no_other_viewer(app):
+    f = await app()
+    p, first, _ = await f.paired()
+    second, second_session = await f.join_viewer(p)
+    await second.send({"type": "stop-request", "session": second_session})
+    assert (await p.next("stop-request"))["session"] == second_session
+    await asyncio.sleep(0.05)
+    # Ending the session is the phone's call to make and to announce. The
+    # other viewers learn about it from the `state` the phone then sends,
+    # not from each other's button presses.
+    assert not any(
+        m["type"] == "stop-request" for m in first.messages
+    ), "stop-request leaked to another viewer"
+
+
+async def test_a_viewer_cannot_stop_on_another_viewers_session(app):
+    f = await app()
+    p, _first, first_session = await f.paired()
+    second, _second_session = await f.join_viewer(p)
+    await second.send({"type": "stop-request", "session": first_session})
+    await asyncio.sleep(0.1)
+    assert not any(
+        m["type"] == "stop-request" for m in p.messages
+    ), "a stop addressed to another viewer's session was relayed"
+
+
 async def test_room_isolation_and_sender_roles_prevent_offer_reflection(app):
     f = await app()
     p, v, session = await f.paired()

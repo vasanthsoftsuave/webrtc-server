@@ -12,6 +12,7 @@ const leave = document.querySelector('#leave');
 const tagbar = document.querySelector('#tagbar');
 const clockEl = document.querySelector('#clock');
 const tagBtn = document.querySelector('#tag');
+const stopBtn = document.querySelector('#stop');
 const tagCountEl = document.querySelector('#tagCount');
 const tagListEl = document.querySelector('#tagList');
 const gazeEl = document.querySelector('#gaze');
@@ -153,14 +154,24 @@ function renderTags() {
 // assumed the phone's and the browser's clocks agreed, which is why it
 // could show a very different time than the app.
 function applyState(state) {
+  const wasRecording = remoteState?.recording === true;
   remoteState = state;
   tagbar.hidden = false;
   tagBtn.disabled = !state.recording;
+  stopBtn.disabled = !state.recording;
+  if (!state.recording) disarmStop();
   clockEl.textContent = formatElapsed(state.elapsedSeconds);
   renderTags();
+  // The phone sends recording:false the moment it stops, whoever asked
+  // for it — its own Stop button or any viewer's. Every viewer lands
+  // here and says the same thing, so nobody is left watching a frozen
+  // clock wondering whether the feed broke.
+  if (wasRecording && !state.recording) status('Recording stopped.');
 }
 function resetTagState() {
   remoteState = null;
+  disarmStop();
+  stopBtn.disabled = true;
   tagbar.hidden = true;
   clockEl.textContent = '00:00';
   tagListEl.hidden = true;
@@ -169,6 +180,34 @@ function resetTagState() {
   tagColors.clear();
 }
 tagBtn.onclick = () => { if (remoteState?.recording) send({ type:'tag-request' }); };
+
+// Stopping ends the recording for the participant and for every other
+// viewer, and it cannot be undone from here — so it takes two taps. The
+// first arms the button and says so; the second, within
+// STOP_ARMED_MS, actually sends. A modal confirm() would do the same job,
+// but this keeps the decision on the control itself and cannot be
+// dismissed by a stray keypress.
+const STOP_ARMED_MS = 4000;
+let stopArmedTimer = null;
+function disarmStop() {
+  clearTimeout(stopArmedTimer);
+  stopArmedTimer = null;
+  stopBtn.classList.remove('armed');
+  stopBtn.textContent = 'Stop recording';
+}
+stopBtn.onclick = () => {
+  if (!remoteState?.recording) return;
+  if (!stopArmedTimer) {
+    stopBtn.classList.add('armed');
+    stopBtn.textContent = 'Tap again to stop';
+    stopArmedTimer = setTimeout(disarmStop, STOP_ARMED_MS);
+    return;
+  }
+  disarmStop();
+  stopBtn.disabled = true;
+  status('Stopping the recording…');
+  send({ type:'stop-request' });
+};
 
 // ------------------------------------------------------------------ sound
 // The video element is permanently muted (its audio lives in #sound), which

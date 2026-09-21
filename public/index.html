@@ -14,8 +14,8 @@
      for the glasses' pipeline to settle - so audio sharing the video element
      stayed silent for that whole window. See viewer.js. -->
 <audio id="sound" autoplay></audio>
-<section class="tagbar" id="tagbar" hidden><span id="clock" class="clock">00:00</span><button id="tag" type="button">+ Add Tag</button><span id="tagCount"></span><button id="mute" type="button" class="secondary toggle-btn" aria-pressed="false" hidden>Sound on</button><label class="toggle"><input id="gazeToggle" type="checkbox" checked> Gaze</label></section>
+<section class="tagbar" id="tagbar" hidden><span id="clock" class="clock">00:00</span><button id="tag" type="button">+ Add Tag</button><button id="stop" type="button" class="stop" disabled>Stop recording</button><span id="tagCount"></span><button id="mute" type="button" class="secondary toggle-btn" aria-pressed="false" hidden>Sound on</button><label class="toggle"><input id="gazeToggle" type="checkbox" checked> Gaze</label></section>
 <ul id="tagList" class="tag-list" hidden aria-label="Tagged moments"></ul>
 <footer><span id="quality">Waiting for video</span><span id="viewers" class="viewers"></span><button id="copy" type="button" class="secondary">Copy viewer link</button></footer>
-<p class="note">Keep the recording phone online. Up to five people can watch the same session code at once.</p>
+<p class="note">Keep the recording phone online. Up to five people can watch the same session code at once. Stopping the recording from here ends it for everyone, exactly as pressing Stop on the phone would.</p>
 </main><script src="/viewer.js" defer></script></body></html>
