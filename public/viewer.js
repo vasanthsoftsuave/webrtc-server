@@ -325,7 +325,12 @@ function scheduleReconnect() {
 }
 async function handle(msg) {
   if (msg.type === 'error') { status(msg.message); return; }
-  if (msg.type === 'joined') { resumeToken = msg.resumeToken || null; return; }
+  // Sent on every `joined`, resume or not: a session that is still live
+  // answers with `resumed` regardless, and the server otherwise ignores a
+  // request it doesn't need (already pending, or one it's about to make
+  // itself for a stale/restarting link) - see access-request in README.md.
+  if (msg.type === 'joined') { resumeToken = msg.resumeToken || null; send({type:'access-request'}); status('Requesting access from the recording phone…'); return; }
+  if (msg.type === 'access-declined') { status('The recording phone declined this request.'); return; }
   if (msg.type === 'viewers') {
     viewersEl.textContent = msg.count ? `${msg.count} of ${msg.max} watching` : '';
     return;

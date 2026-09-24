@@ -8,6 +8,7 @@ import json
 import re
 import time
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 from aiohttp import ClientSession, WSMsgType, web
@@ -74,19 +75,47 @@ class Fixture:
         self._peers: list[Peer] = []
 
     async def connect(
-        self, role: str, room: str = "test-room", resume: str | None = None
+        self,
+        role: str,
+        room: str = "test-room",
+        resume: str | None = None,
+        device_name: str | None = None,
+        account_name: str | None = None,
+        account_role: str | None = None,
     ) -> Peer:
         query = f"?role={role}"
         if resume:
             query += f"&resume={resume}"
+        if device_name:
+            query += f"&deviceName={quote(device_name)}"
+        if account_name:
+            query += f"&accountName={quote(account_name)}"
+        if account_role:
+            query += f"&accountRole={quote(account_role)}"
         ws_base = self.base.replace("http://", "ws://")
         peer = Peer(self._client, f"{ws_base}/signal/{room}{query}")
         self._peers.append(peer)
         return await peer.open()
 
+    async def respond_access(self, publisher: Peer, accepted: bool = True) -> str:
+        """Answer whatever `access-request` the publisher is holding -
+        whether the viewer asked explicitly or the server raised one on its
+        own (a restart, or a stale link resuming). Returns the viewer id."""
+        request = await publisher.next("access-request")
+        await publisher.send(
+            {"type": "access-response", "viewer": request["viewer"], "accepted": accepted}
+        )
+        return request["viewer"]
+
+    async def grant_access(self, publisher: Peer, viewer: Peer, accepted: bool = True) -> str:
+        """A fresh viewer's own explicit request, then the publisher's answer."""
+        await viewer.send({"type": "access-request"})
+        return await self.respond_access(publisher, accepted)
+
     async def paired(self) -> tuple[Peer, Peer, str]:
         publisher = await self.connect("publisher")
         viewer = await self.connect("viewer")
+        await self.grant_access(publisher, viewer)
         a, b = await asyncio.gather(publisher.next("ready"), viewer.next("ready"))
         assert a["session"] == b["session"]
         return publisher, viewer, a["session"]
@@ -95,6 +124,7 @@ class Fixture:
         """One more viewer into a room that already has a publisher, returning
         it with the session naming its own link."""
         viewer = await self.connect("viewer", room)
+        await self.grant_access(publisher, viewer)
         mine, theirs = await asyncio.gather(viewer.next("ready"), publisher.next("ready"))
         assert mine["session"] == theirs["session"]
         return viewer, mine["session"]
@@ -166,6 +196,7 @@ async def test_late_viewer_gets_new_negotiation_and_routed_offer_answer_early_ic
     await p.next("joined")
     assert not any(m["type"] == "ready" for m in p.messages)
     v = await f.connect("viewer")
+    await f.grant_access(p, v)
     ready = await v.next("ready")
     await p.next("ready")
     await p.send(
@@ -194,6 +225,7 @@ async def test_viewer_reload_invalidates_old_session_and_does_not_replay_sdp_his
     # which one to close.
     assert (await p.next("peer-left"))["session"] == session
     fresh = await f.connect("viewer")
+    await f.grant_access(p, fresh)
     nxt = await fresh.next("ready")
     await p.next("ready")
     assert nxt["session"] != session
@@ -209,6 +241,8 @@ async def test_restart_assigns_a_fresh_session_to_both_peers(app):
     f = await app()
     p, v, session = await f.paired()
     await v.send({"type": "restart", "session": session})
+    # A restart is still a new pairing: the publisher must grant it too.
+    await f.respond_access(p)
     a, b = await asyncio.gather(p.next("ready"), v.next("ready"))
     assert a["session"] == b["session"]
     assert a["session"] != session
@@ -222,10 +256,14 @@ async def test_both_peers_restarting_at_once_are_coalesced_into_a_single_repair(
     # re-pair would throw away the connection the first one just built.
     await p.send({"type": "restart", "session": session})
     await v.send({"type": "restart", "session": session})
+    await f.respond_access(p)
     a, b = await asyncio.gather(p.next("ready"), v.next("ready"))
     assert a["session"] == b["session"]
     assert a["session"] != session
     await asyncio.sleep(0.3)
+    assert not any(
+        m["type"] == "access-request" for m in p.messages
+    ), "publisher was asked twice"
     assert not any(m["type"] == "ready" for m in p.messages), "publisher was re-paired twice"
     assert not any(m["type"] == "ready" for m in v.messages), "viewer was re-paired twice"
     assert f.slot(a["session"]) is not None
@@ -274,9 +312,70 @@ async def test_a_restart_while_the_other_peer_is_offline_runs_after_it_resumes(a
         await asyncio.sleep(0.01)
     assert f.slot(session).restart_pending is True
     resumed_viewer = await f.connect("viewer", "test-room", viewer_token)
+    await f.respond_access(p)
     a, b = await asyncio.gather(p.next("ready"), resumed_viewer.next("ready"))
     assert a["session"] == b["session"]
     assert a["session"] != session
+
+
+async def test_a_fresh_viewer_is_not_paired_until_the_publisher_grants_access(app):
+    f = await app()
+    p = await f.connect("publisher")
+    await p.next("joined")
+    v = await f.connect("viewer")
+    await v.next("joined")
+    await v.send({"type": "access-request"})
+    request = await p.next("access-request")
+    assert isinstance(request["viewer"], str) and request["viewer"]
+    # Nothing is minted while the request is outstanding.
+    await asyncio.sleep(0.05)
+    assert not any(m["type"] == "ready" for m in v.messages)
+    assert not any(m["type"] == "ready" for m in p.messages)
+    await p.send({"type": "access-response", "viewer": request["viewer"], "accepted": True})
+    a, b = await asyncio.gather(p.next("ready"), v.next("ready"))
+    assert a["session"] == b["session"]
+
+
+async def test_a_declined_access_request_leaves_the_viewer_connected_to_try_again(app):
+    f = await app()
+    p = await f.connect("publisher")
+    v = await f.connect("viewer")
+    await v.send({"type": "access-request"})
+    request = await p.next("access-request")
+    await p.send({"type": "access-response", "viewer": request["viewer"], "accepted": False})
+    assert await v.next("access-declined") is not None
+    await asyncio.sleep(0.05)
+    assert not any(m["type"] == "ready" for m in v.messages)
+    assert not any(m["type"] == "ready" for m in p.messages)
+    # The socket is untouched by the decline - it can ask again.
+    assert not v.socket.closed
+    await v.send({"type": "access-request"})
+    request = await p.next("access-request")
+    await p.send({"type": "access-response", "viewer": request["viewer"], "accepted": True})
+    a, b = await asyncio.gather(p.next("ready"), v.next("ready"))
+    assert a["session"] == b["session"]
+
+
+async def test_a_stray_access_response_for_an_unrequested_or_departed_viewer_is_ignored(app):
+    f = await app()
+    p = await f.connect("publisher")
+    v = await f.connect("viewer")
+    await v.next("joined")
+    # No access-request was ever sent for this viewer id, so nothing should
+    # happen: no session minted, no message sent anywhere.
+    viewer_id = next(iter(f.rooms["test-room"].viewers))
+    await p.send({"type": "access-response", "viewer": viewer_id, "accepted": True})
+    await asyncio.sleep(0.05)
+    assert not any(m["type"] == "ready" for m in v.messages)
+    assert not any(m["type"] == "ready" for m in p.messages)
+    # A genuine request that is answered twice only pairs once.
+    await v.send({"type": "access-request"})
+    request = await p.next("access-request")
+    await p.send({"type": "access-response", "viewer": request["viewer"], "accepted": True})
+    await asyncio.gather(p.next("ready"), v.next("ready"))
+    await p.send({"type": "access-response", "viewer": request["viewer"], "accepted": True})
+    await asyncio.sleep(0.05)
+    assert not any(m["type"] == "ready" for m in v.messages), "a stale response re-paired the link"
 
 
 async def test_a_second_publisher_is_refused_without_disturbing_existing_peers(app):
@@ -406,6 +505,103 @@ async def test_state_rejects_malformed_payloads_instead_of_relaying_them(app):
     assert state["tags"] == [{"id": 1, "label": "", "tagSeconds": 1}]
 
 
+async def test_ready_carries_device_name_when_the_publisher_supplied_one(app):
+    f = await app()
+    p = await f.connect("publisher", device_name="Tobii Pro Glasses 3")
+    v = await f.connect("viewer")
+    await f.grant_access(p, v)
+    ready = await v.next("ready")
+    assert ready["deviceName"] == "Tobii Pro Glasses 3"
+
+
+async def test_ready_omits_device_name_when_the_publisher_supplied_none(app):
+    f = await app()
+    p = await f.connect("publisher")
+    v = await f.connect("viewer")
+    await f.grant_access(p, v)
+    ready = await v.next("ready")
+    assert "deviceName" not in ready
+
+
+async def test_joined_carries_the_publishers_identity_when_it_already_supplied_one(app):
+    f = await app()
+    await f.connect(
+        "publisher",
+        device_name="Tobii Pro Glasses 3",
+        account_name="Alex Rivera",
+        account_role="Technician",
+    )
+    v = await f.connect("viewer")
+    joined = await v.next("joined")
+    assert joined["deviceName"] == "Tobii Pro Glasses 3"
+    assert joined["accountName"] == "Alex Rivera"
+    assert joined["accountRole"] == "Technician"
+
+
+async def test_joined_omits_identity_fields_when_no_publisher_has_supplied_any(app):
+    f = await app()
+    v = await f.connect("viewer")
+    joined = await v.next("joined")
+    assert "deviceName" not in joined
+    assert "accountName" not in joined
+    assert "accountRole" not in joined
+
+
+async def test_state_relays_device_batteries_to_every_viewer(app):
+    f = await app()
+    p, v, session = await f.paired()
+    await p.send(
+        {
+            "type": "state",
+            "session": session,
+            "recording": True,
+            "elapsedSeconds": 5,
+            "tags": [],
+            "deviceBatteries": [{"label": "Glass", "percent": 87}],
+        }
+    )
+    state = await v.next("state")
+    assert state["deviceBatteries"] == [{"label": "Glass", "percent": 87}]
+
+
+async def test_state_defaults_device_batteries_to_empty_when_absent(app):
+    f = await app()
+    p, v, session = await f.paired()
+    await p.send(
+        {"type": "state", "session": session, "recording": True, "elapsedSeconds": 5, "tags": []}
+    )
+    state = await v.next("state")
+    assert state["deviceBatteries"] == []
+
+
+async def test_state_rejects_malformed_device_batteries_instead_of_relaying_them(app):
+    f = await app()
+    p, v, session = await f.paired()
+    await p.send(
+        {
+            "type": "state",
+            "session": session,
+            "recording": True,
+            "elapsedSeconds": 1,
+            "tags": [],
+            "deviceBatteries": [{"label": "Glass", "percent": 150}],
+        }
+    )
+    await p.send(
+        {
+            "type": "state",
+            "session": session,
+            "recording": True,
+            "elapsedSeconds": 2,
+            "tags": [],
+            "deviceBatteries": [{"label": "Glass", "percent": 50}],
+        }
+    )
+    state = await v.next("state")
+    assert state["elapsedSeconds"] == 2
+    assert state["deviceBatteries"] == [{"label": "Glass", "percent": 50}]
+
+
 async def test_gaze_reaches_every_viewer_and_non_numbers_are_dropped(app):
     f = await app()
     p, first, first_session = await f.paired()
@@ -526,6 +722,111 @@ async def test_a_publisher_resume_keeps_a_viewer_that_is_itself_reconnecting(app
     assert (await resumed_publisher.next("resumed"))["sessions"] == [session]
     resumed_viewer = await f.connect("viewer", "test-room", viewer_token)
     assert (await resumed_viewer.next("resumed"))["session"] == session
+
+
+async def test_a_view_request_is_approved_and_mirrors_the_session_and_capabilities(app):
+    f = await app()
+    p = await f.connect("publisher")
+    v = await f.connect("viewer")
+    await v.send({"type": "view-request", "capabilities": ["VIEW_MEDIA", "HEAR_AUDIO"]})
+    # The same access-request the legacy path raises - the publisher side
+    # never has to know a view-request triggered it.
+    request = await p.next("access-request")
+    pending = await v.next("view-pending")
+    assert pending["requestId"]
+    assert pending["expiresAt"] > time.time() * 1000
+    await p.send({"type": "access-response", "viewer": request["viewer"], "accepted": True})
+    ready, approved = await asyncio.gather(v.next("ready"), v.next("view-approved"))
+    assert approved["requestId"] == pending["requestId"]
+    assert approved["session"] == ready["session"]
+    assert approved["capabilities"] == ["VIEW_MEDIA", "HEAR_AUDIO"]
+
+
+async def test_a_declined_view_request_tells_the_viewer_and_leaves_it_connected(app):
+    f = await app()
+    p = await f.connect("publisher")
+    v = await f.connect("viewer")
+    await v.send({"type": "view-request", "capabilities": []})
+    request = await p.next("access-request")
+    pending = await v.next("view-pending")
+    await p.send({"type": "access-response", "viewer": request["viewer"], "accepted": False})
+    declined = await v.next("view-declined")
+    assert declined["requestId"] == pending["requestId"]
+    assert not v.socket.closed
+    assert not any(m["type"] == "view-approved" for m in v.messages)
+
+
+async def test_a_view_requests_viewer_name_and_role_are_relayed_on_the_access_request(app):
+    f = await app()
+    p = await f.connect("publisher")
+    v = await f.connect("viewer")
+    await v.send(
+        {
+            "type": "view-request",
+            "capabilities": [],
+            "viewerName": "Jordan Lee",
+            "role": "Supervisor",
+        }
+    )
+    request = await p.next("access-request")
+    assert request["viewerName"] == "Jordan Lee"
+    assert request["role"] == "Supervisor"
+
+
+async def test_a_view_request_with_no_viewer_name_omits_it_from_the_access_request(app):
+    f = await app()
+    p = await f.connect("publisher")
+    v = await f.connect("viewer")
+    await v.send({"type": "view-request", "capabilities": []})
+    request = await p.next("access-request")
+    assert "viewerName" not in request
+    assert "role" not in request
+
+
+async def test_an_unanswered_view_request_expires_and_a_late_response_is_ignored(app):
+    f = await app(view_request_ttl_ms=50)
+    p = await f.connect("publisher")
+    v = await f.connect("viewer")
+    await v.send({"type": "view-request", "capabilities": []})
+    request = await p.next("access-request")
+    pending = await v.next("view-pending")
+    expired = await v.next("view-expired")
+    assert expired["requestId"] == pending["requestId"]
+    # The publisher answering after the deadline must not resurrect it.
+    await p.send({"type": "access-response", "viewer": request["viewer"], "accepted": True})
+    await asyncio.sleep(0.05)
+    assert not any(m["type"] == "ready" for m in v.messages)
+    assert not any(m["type"] == "view-approved" for m in v.messages)
+
+
+async def test_a_view_request_is_a_no_op_while_one_is_already_pending(app):
+    f = await app()
+    p = await f.connect("publisher")
+    v = await f.connect("viewer")
+    await v.send({"type": "view-request", "capabilities": []})
+    request = await p.next("access-request")
+    first_pending = await v.next("view-pending")
+    await v.send({"type": "view-request", "capabilities": []})
+    await asyncio.sleep(0.05)
+    assert not any(m["type"] == "view-pending" for m in v.messages), "a second request was queued"
+    await p.send({"type": "access-response", "viewer": request["viewer"], "accepted": True})
+    approved = await v.next("view-approved")
+    assert approved["requestId"] == first_pending["requestId"]
+
+
+async def test_a_restart_raised_access_request_never_produces_a_view_message(app):
+    """The server also raises `access-request` on its own initiative (a
+    restart, a stale link resuming) - see `request_access`'s docstring.
+    Those never carry a requestId and must never produce a `view-*`
+    message, since the client holding that link isn't watching for one."""
+    f = await app()
+    p, v, session = await f.paired()
+    await p.send({"type": "restart", "session": session})
+    request = await p.next("access-request")
+    await p.send({"type": "access-response", "viewer": request["viewer"], "accepted": True})
+    a, b = await asyncio.gather(p.next("ready"), v.next("ready"))
+    assert a["session"] == b["session"]
+    assert not any(m["type"].startswith("view-") for m in v.messages)
 
 
 async def test_turn_config_supports_expiring_shared_secret_credentials_and_fails_closed():

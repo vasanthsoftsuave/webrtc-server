@@ -8,7 +8,7 @@ Deploy behind a stable HTTPS/WSS hostname. A room supports one publisher and
 up to [DEFAULT_MAX_VIEWERS] viewers; a deliberate refresh gets a new
 negotiation.
 
-Protocol 3 (was 2):
+Protocol 4 (was 3):
 
 - A room holds several viewers, each with its own `session`. The session id
   names one publisher<->viewer *link*, not the room: an offer, answer,
@@ -21,6 +21,60 @@ Protocol 3 (was 2):
   so the browser can draw the same reticle the phone draws.
 - `tag-request` and `stop-request` (any viewer -> publisher) drive the
   phone's own tag and stop controls from the browser.
+- No viewer is paired without the publisher's explicit say-so. A viewer
+  sends `access-request`; the server relays it to the publisher as
+  `{"type": "access-request", "viewer": <id>}`; only once the publisher
+  answers with `{"type": "access-response", "viewer": <id>, "accepted":
+  true}` does the server mint a session and send `ready`. `accepted: false`
+  (or anything else) sends the viewer `access-declined` instead - the
+  viewer's socket is left exactly as it was, so it can ask again. This gate
+  applies to every new pairing, including a restart and a stale link picked
+  back up after the publisher itself resumes - not only a viewer's first
+  join. It does not apply to a plain resume of a session whose media
+  connection never actually died (the server sends `resumed`, not `ready`,
+  for that case): nothing new is being granted there, only a signaling
+  socket reconnecting to a link that was never revoked.
+
+Two additive, fully optional wire fields (no version bump - an older client
+or server on either end is unaffected either way):
+
+- A publisher may connect with `?deviceName=<name>` on its `/signal/{room}`
+  URL (e.g. "Tobii Pro Glasses 3") - if set, every `ready` the server later
+  sends a viewer for that room carries `"deviceName"`. Absent entirely if
+  the publisher never supplied one.
+- `state` (publisher -> every viewer) may carry `"deviceBatteries"`: a list
+  of `{"label": <str>, "percent": <0-100>}` for the paired capture device's
+  own battery level(s) - NOT the phone's battery. Forwarded as `[]` when
+  absent from the publisher's message, same fail-closed validation as
+  `tags` when present but malformed.
+- A viewer's `view-request` may carry `"viewerName"`/`"role"` (free-text,
+  sanitized/truncated the same way as `deviceName`) - if present, the
+  `access-request` this raises for the publisher carries them unchanged, so
+  its approval prompt can show who's asking. Omitted entirely when the
+  viewer didn't send one.
+- A publisher may also connect with `?accountName=<name>&accountRole=<role>`
+  alongside `?deviceName=`, describing the signed-in capture account rather
+  than the glasses. Whenever a viewer's signaling socket opens for a room
+  that already has a publisher, its own `joined` reply carries whichever of
+  `deviceName`/`accountName`/`accountRole` the publisher supplied - sent
+  immediately, independent of `access-request`/`access-response`, since this
+  is "who would I be connecting to" information, not media access.
+
+A third additive layer, `view-request`/`view-pending`/`view-approved`/
+`view-declined`/`view-expired`: a tracked, user-facing wrapper a viewer may
+use instead of the bare `access-request` above. `view-request` (optionally
+carrying `"capabilities"`, a list of strings echoed back unchanged on
+approval) mints a `requestId` and replies `view-pending` with an
+`expiresAt` (epoch ms); it then raises the exact same `access-request` the
+publisher already answers with `access-response`. That answer is mirrored
+back to the viewer as `view-approved` (carrying the session `pair()`
+minted and the echoed capabilities) or `view-declined`, or - if the
+publisher never answers within `view_request_ttl_ms` - `view-expired`. A
+`requestId` is only ever present for a link a viewer explicitly opened this
+way; the `access-request`s this server raises on its own (a restart, a
+stale link resuming) stay exactly as before and never produce a `view-*`
+message, since the client that already holds a live session isn't watching
+for one.
 """
 
 from __future__ import annotations
@@ -87,6 +141,17 @@ def _is_int(value: Any) -> bool:
 def _is_finite_number(value: Any) -> bool:
     """Number.isFinite() - rejects NaN, the infinities, and booleans."""
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _sanitize_label(value: Any, max_len: int = 100) -> str | None:
+    """Fail-closed cleanup for a free-text identity field (viewer name/role,
+    capture account name/role) arriving from either a query param or a
+    signaling message: non-string, blank, and empty become `None` rather
+    than being fabricated or passed through unchecked, and length is capped
+    the same way `deviceName` already is."""
+    if not isinstance(value, str):
+        return None
+    return value.strip()[:max_len] or None
 
 
 # Cloudflare Realtime TURN takes priority when configured (CF_TURN_KEY_ID +
@@ -223,6 +288,12 @@ def turn_provider(env: Mapping[str, str] | None = None) -> dict[str, Any]:
 # window of the last pairing.
 RESTART_DEBOUNCE_MS = 3000
 
+# How long a `view-request` waits for the publisher's decision before the
+# viewer is told `view-expired`. Independent of the publisher's own socket
+# heartbeat - a publisher that is connected but simply hasn't tapped
+# Approve/Deny yet is the normal case this bounds, not a failure.
+VIEW_REQUEST_TTL_MS = 30000
+
 
 class ViewerSlot:
     """One viewer's place in a room: its socket, its resume token, and the
@@ -243,6 +314,12 @@ class ViewerSlot:
         "restart_timer",
         "restart_pending",
         "expiry_timer",
+        "awaiting_access",
+        "view_request_id",
+        "view_capabilities",
+        "view_request_timer",
+        "viewer_name",
+        "viewer_role",
     )
 
     def __init__(self, viewer_id: str, token: str) -> None:
@@ -256,13 +333,33 @@ class ViewerSlot:
         # Set only while the slot is being held open for a viewer whose
         # socket dropped abruptly - see the close handler.
         self.expiry_timer: asyncio.TimerHandle | None = None
+        # True from the moment this link needs a fresh session until the
+        # publisher answers `access-response` for it. See `request_access`.
+        self.awaiting_access: bool = False
+        # Set only for a link currently inside the `view-request` ->
+        # `view-pending` -> {approved|declined|expired} lifecycle - see
+        # `start_view_request`. `None` for every `access-request` this
+        # server raises on its own (restart, a stale link resuming): those
+        # stay on the plain `access-request`/`access-declined` shape a
+        # client that already holds a session isn't watching for.
+        self.view_request_id: str | None = None
+        self.view_capabilities: list[str] = []
+        self.view_request_timer: asyncio.TimerHandle | None = None
+        # The requesting viewer's own display name/role, as sent on its
+        # `view-request` - purely informational, relayed unchanged to the
+        # publisher's `access-request` so its approval prompt can show who's
+        # asking. `None` for a plain `access-request` this server raises on
+        # its own (restart, a stale link resuming), same as view_request_id.
+        self.viewer_name: str | None = None
+        self.viewer_role: str | None = None
 
     def cancel_timers(self) -> None:
-        for timer in (self.restart_timer, self.expiry_timer):
+        for timer in (self.restart_timer, self.expiry_timer, self.view_request_timer):
             if timer:
                 timer.cancel()
         self.restart_timer = None
         self.expiry_timer = None
+        self.view_request_timer = None
 
 
 class Room:
@@ -274,11 +371,29 @@ class Room:
     those would have invalidated every other viewer's in-flight signaling.
     """
 
-    __slots__ = ("publisher", "publisher_token", "viewers", "cleanup_timer")
+    __slots__ = (
+        "publisher",
+        "publisher_token",
+        "publisher_device_name",
+        "publisher_account_name",
+        "publisher_account_role",
+        "viewers",
+        "cleanup_timer",
+    )
 
     def __init__(self) -> None:
         self.publisher: web.WebSocketResponse | None = None
         self.publisher_token: str | None = None
+        # The paired capture device's own name (e.g. "Tobii Pro Glasses 3"),
+        # as the publisher reported it on connect - see `signal_handler`'s
+        # publisher branch. `None` until a publisher has ever supplied one.
+        self.publisher_device_name: str | None = None
+        # The signed-in capture account's own name/role, as the publisher
+        # reported it on connect (`?accountName=`/`?accountRole=`) - distinct
+        # from publisher_device_name, which describes the glasses, not the
+        # person. `None` until a publisher has ever supplied one.
+        self.publisher_account_name: str | None = None
+        self.publisher_account_role: str | None = None
         self.viewers: dict[str, ViewerSlot] = {}
         self.cleanup_timer: asyncio.TimerHandle | None = None
 
@@ -322,6 +437,7 @@ def create_server(
     resume_ttl_ms: int = 120000,
     restart_debounce_ms: int = RESTART_DEBOUNCE_MS,
     max_viewers: int | None = None,
+    view_request_ttl_ms: int = VIEW_REQUEST_TTL_MS,
 ) -> SignalingServer:
     env = os.environ if env is None else env
     if max_viewers is None:
@@ -363,7 +479,7 @@ def create_server(
         path = request.path
         if path == "/health":
             return web.json_response(
-                {"ok": True, "protocol": 3, "media": "video+audio", "maxViewers": max_viewers},
+                {"ok": True, "protocol": 4, "media": "video+audio", "maxViewers": max_viewers},
                 headers=headers,
             )
         if path == "/ice-servers":
@@ -402,17 +518,99 @@ def create_server(
     async def pair(room: Room, slot: ViewerSlot) -> None:
         """Mint a fresh session for one publisher<->viewer link and tell both
         ends. The publisher's copy carries `viewer`, the slot's stable id
-        across re-pairings, so the two sides' logs can be lined up."""
+        across re-pairings, so the two sides' logs can be lined up.
+
+        Only ever called once the publisher has granted `access-response`
+        for this slot - see `request_access` and its call sites below."""
         if room.publisher is None or slot.socket is None:
             return
         if slot.restart_timer:
             slot.restart_timer.cancel()
             slot.restart_timer = None
         slot.restart_pending = False
+        slot.awaiting_access = False
         slot.session = str(uuid.uuid4())
         slot.paired_at = _now_ms()
-        await send(slot.socket, {"type": "ready", "session": slot.session})
+        ready_for_viewer: dict[str, Any] = {"type": "ready", "session": slot.session}
+        if room.publisher_device_name:
+            ready_for_viewer["deviceName"] = room.publisher_device_name
+        await send(slot.socket, ready_for_viewer)
         await send(room.publisher, {"type": "ready", "session": slot.session, "viewer": slot.id})
+
+    async def request_access(room: Room, slot: ViewerSlot) -> None:
+        """Ask the publisher whether this link may be (re)paired, instead of
+        minting a session outright.
+
+        Every site that used to call `pair()` directly on its own initiative
+        - a fresh viewer joining an already-present publisher, a publisher
+        arriving to viewers still waiting, a restart, or a stale link being
+        picked back up after the publisher itself resumes - calls this
+        instead. `pair()` now only runs from `on_publisher_message`'s
+        `access-response` handler, once accepted.
+
+        A no-op if the publisher is not connected yet: the slot is left
+        marked, and whichever branch next assigns `room.publisher` relays
+        the outstanding request then.
+        """
+        if slot.socket is None:
+            return
+        if slot.restart_timer:
+            slot.restart_timer.cancel()
+            slot.restart_timer = None
+        slot.awaiting_access = True
+        request_msg: dict[str, Any] = {"type": "access-request", "viewer": slot.id}
+        if slot.viewer_name:
+            request_msg["viewerName"] = slot.viewer_name
+        if slot.viewer_role:
+            request_msg["role"] = slot.viewer_role
+        await send(room.publisher, request_msg)
+
+    async def start_view_request(room: Room, slot: ViewerSlot, msg: dict[str, Any]) -> None:
+        """The tracked, user-facing entry point for a fresh viewer's own
+        request: mint a `requestId`, tell the viewer it's `view-pending`,
+        then raise the exact same `access-request` [request_access] already
+        knows how to relay and have answered.
+
+        Same guard as the legacy `access-request` branch below, and for the
+        same reason - a client retrying defensively (or a duplicate tap)
+        must not queue a second request for a link already paired or
+        already awaiting one.
+        """
+        if slot.session is not None or slot.awaiting_access:
+            return
+        if slot.view_request_timer:
+            slot.view_request_timer.cancel()
+            slot.view_request_timer = None
+        request_id = str(uuid.uuid4())
+        slot.view_request_id = request_id
+        slot.viewer_name = _sanitize_label(msg.get("viewerName"))
+        slot.viewer_role = _sanitize_label(msg.get("role"))
+        raw_capabilities = msg.get("capabilities")
+        slot.view_capabilities = (
+            [c for c in raw_capabilities if isinstance(c, str)]
+            if isinstance(raw_capabilities, list)
+            else []
+        )
+        expires_at = int(time.time() * 1000) + view_request_ttl_ms
+
+        async def expire_view_request() -> None:
+            slot.view_request_timer = None
+            # Superseded by a later request, or already resolved - the
+            # `awaiting_access` publisher-side guard already ignores a late
+            # `access-response` for this same reason.
+            if slot.view_request_id != request_id or not slot.awaiting_access:
+                return
+            slot.awaiting_access = False
+            slot.view_request_id = None
+            slot.view_capabilities = []
+            await send(slot.socket, {"type": "view-expired", "requestId": request_id})
+
+        slot.view_request_timer = later(view_request_ttl_ms, expire_view_request)
+        await send(
+            slot.socket,
+            {"type": "view-pending", "requestId": request_id, "expiresAt": expires_at},
+        )
+        await request_access(room, slot)
 
     async def broadcast_viewers(room: Room) -> None:
         """Tell everyone how full the room is. The phone reports it as
@@ -431,6 +629,9 @@ def create_server(
         match = SIGNAL_PATH.match(request.path)
         role = request.query.get("role")
         resume = request.query.get("resume") or None
+        device_name_param = (request.query.get("deviceName") or "").strip()[:100] or None
+        account_name_param = _sanitize_label(request.query.get("accountName"))
+        account_role_param = _sanitize_label(request.query.get("accountRole"))
         if not match or role not in ("publisher", "viewer"):
             return web.Response(status=400, text="Bad Request")
         name = match.group(1)
@@ -477,6 +678,12 @@ def create_server(
             if not is_resume:
                 room.publisher_token = str(uuid.uuid4())
             room.publisher = socket
+            if device_name_param is not None:
+                room.publisher_device_name = device_name_param
+            if account_name_param is not None:
+                room.publisher_account_name = account_name_param
+            if account_role_param is not None:
+                room.publisher_account_role = account_role_param
             await send(
                 socket,
                 {
@@ -510,11 +717,11 @@ def create_server(
                 )
                 await send(socket, {"type": "resumed", "sessions": intact})
                 for pending in stale:
-                    await pair(room, pending)
+                    await request_access(room, pending)
             else:
                 print(f"[{name}] publisher joined fresh", flush=True)
                 for existing in room.connected_viewers:
-                    await pair(room, existing)
+                    await request_access(room, existing)
         else:
             slot = room.viewer_by_token(resume) if resume else None
             is_resume = slot is not None
@@ -545,17 +752,25 @@ def create_server(
             if slot.expiry_timer:
                 slot.expiry_timer.cancel()
                 slot.expiry_timer = None
-            await send(
-                socket,
-                {
-                    "type": "joined",
-                    "role": role,
-                    "media": "video+audio",
-                    "resumeToken": slot.token,
-                    "viewerId": slot.id,
-                    "maxViewers": max_viewers,
-                },
-            )
+            joined_for_viewer: dict[str, Any] = {
+                "type": "joined",
+                "role": role,
+                "media": "video+audio",
+                "resumeToken": slot.token,
+                "viewerId": slot.id,
+                "maxViewers": max_viewers,
+            }
+            # "Who would I be connecting to" - sent as soon as the viewer's
+            # socket opens, independent of access-request/access-response:
+            # this is identity, not media access, so it isn't gated on the
+            # publisher's approval the way `ready` is.
+            if room.publisher_device_name:
+                joined_for_viewer["deviceName"] = room.publisher_device_name
+            if room.publisher_account_name:
+                joined_for_viewer["accountName"] = room.publisher_account_name
+            if room.publisher_account_role:
+                joined_for_viewer["accountRole"] = room.publisher_account_role
+            await send(socket, joined_for_viewer)
             if is_resume and slot.session and not slot.restart_pending:
                 print(f"[{name}] viewer resumed (session {slot.session})", flush=True)
                 await send(socket, {"type": "resumed", "session": slot.session})
@@ -573,7 +788,14 @@ def create_server(
                     f"({len(room.connected_viewers)}/{max_viewers} watching)",
                     flush=True,
                 )
-                await pair(room, slot)
+                if is_resume:
+                    # The link once had the publisher's say-so and is only
+                    # being picked back up - the server asks again on the
+                    # viewer's behalf rather than making it re-request.
+                    await request_access(room, slot)
+                # A genuinely fresh viewer has asked for nothing yet: wait
+                # for its own explicit `access-request` (see
+                # on_viewer_message) before troubling the publisher.
         await broadcast_viewers(room)
 
         async def request_restart(target: ViewerSlot, who: str) -> None:
@@ -592,7 +814,7 @@ def create_server(
                         if rooms.get(name) is not room or not target.session:
                             return
                         target.restart_pending = True
-                        await pair(room, target)
+                        await request_access(room, target)
 
                     target.restart_timer = later(restart_debounce_ms - since_pair, fire_restart)
                 print(
@@ -601,7 +823,7 @@ def create_server(
                 )
                 return
             target.restart_pending = True
-            await pair(room, target)
+            await request_access(room, target)
 
         async def relay_candidate(
             msg: dict[str, Any], destination: web.WebSocketResponse | None, session: str | None
@@ -664,6 +886,26 @@ def create_server(
                 tags.append(
                     {"id": tag["id"], "label": tag["label"], "tagSeconds": tag["tagSeconds"]}
                 )
+            # Optional: the paired capture device's own battery level(s) -
+            # e.g. the glasses, NOT the phone's own battery. Absent entirely
+            # is fine (forwarded as `[]`, same as today); present-but-
+            # malformed drops the whole message, same fail-closed rule as
+            # `tags` above rather than silently truncating.
+            raw_batteries = msg.get("deviceBatteries")
+            batteries: list[dict[str, Any]] = []
+            if raw_batteries is not None:
+                if not isinstance(raw_batteries, list) or len(raw_batteries) > 5:
+                    return
+                for battery in raw_batteries:
+                    if (
+                        not isinstance(battery, dict)
+                        or not isinstance(battery.get("label"), str)
+                        or len(battery["label"]) > 50
+                        or not _is_int(battery.get("percent"))
+                        or not (0 <= battery["percent"] <= 100)
+                    ):
+                        return
+                    batteries.append({"label": battery["label"], "percent": battery["percent"]})
             # Stamped with each viewer's OWN session: every client drops a
             # message whose session is not the one it is paired on, so a
             # single shared copy would be discarded by all but at most one.
@@ -676,6 +918,7 @@ def create_server(
                         "recording": recording,
                         "elapsedSeconds": elapsed,
                         "tags": tags,
+                        "deviceBatteries": batteries,
                     },
                 )
 
@@ -715,6 +958,44 @@ def create_server(
 
         async def on_publisher_message(msg: dict[str, Any]) -> None:
             msg_type = msg.get("type")
+            if msg_type == "access-response":
+                viewer_id = msg.get("viewer")
+                target = room.viewers.get(viewer_id) if isinstance(viewer_id, str) else None
+                # Ignoring rather than erroring covers a viewer that left, was
+                # already resolved, or was never asked about - a stray or
+                # duplicate response should not resurrect a dead link.
+                if target is None or not target.awaiting_access:
+                    return
+                # Only set for a link a viewer opened with its own tracked
+                # `view-request` (see `start_view_request`) - an
+                # access-request this server raised on its own (restart, a
+                # resuming stale link) has no requestId and produces no
+                # `view-*` message, same as before this layer existed.
+                request_id = target.view_request_id
+                capabilities = target.view_capabilities
+                if target.view_request_timer:
+                    target.view_request_timer.cancel()
+                    target.view_request_timer = None
+                target.view_request_id = None
+                target.view_capabilities = []
+                if msg.get("accepted") is True:
+                    await pair(room, target)
+                    if request_id is not None:
+                        await send(
+                            target.socket,
+                            {
+                                "type": "view-approved",
+                                "requestId": request_id,
+                                "session": target.session,
+                                "capabilities": capabilities,
+                            },
+                        )
+                else:
+                    target.awaiting_access = False
+                    await send(target.socket, {"type": "access-declined"})
+                    if request_id is not None:
+                        await send(target.socket, {"type": "view-declined", "requestId": request_id})
+                return
             if msg_type == "restart":
                 target = room.viewer_by_session(msg.get("session"))
                 if target is not None:
@@ -753,6 +1034,19 @@ def create_server(
 
         async def on_viewer_message(msg: dict[str, Any], mine: ViewerSlot) -> None:
             msg_type = msg.get("type")
+            if msg_type == "view-request":
+                await start_view_request(room, mine, msg)
+                return
+            if msg_type == "access-request":
+                # A fresh join has nothing yet, so this is the only trigger
+                # for it (see signal_handler above); a resume already
+                # marked `awaiting_access` itself, so a client that sends
+                # this defensively on every `joined` is a harmless no-op
+                # here. Already paired - a plain `resumed` session, say -
+                # needs no request at all.
+                if mine.session is None and not mine.awaiting_access:
+                    await request_access(room, mine)
+                return
             if msg_type == "restart" and mine.session and msg.get("session") == mine.session:
                 await request_restart(mine, "viewer")
                 return
@@ -856,6 +1150,7 @@ def create_server(
                         viewer.session = None
                         viewer.restart_pending = False
                         viewer.paired_at = None
+                        viewer.awaiting_access = False
                         await send(viewer.socket, {"type": "peer-left", "role": "publisher"})
             else:
                 mine = slot
@@ -980,7 +1275,7 @@ def main() -> None:
     server = create_server()
     provider = turn_provider()
     max_viewers = int(os.environ.get("MAX_VIEWERS") or DEFAULT_MAX_VIEWERS)
-    print(f"Neurora remote view: http://localhost:{port}/ (protocol 3)", flush=True)
+    print(f"Neurora remote view: http://localhost:{port}/ (protocol 4)", flush=True)
     print(f"Viewers per session: up to {max_viewers}", flush=True)
     print(f"TURN provider: {provider['name']}", flush=True)
     if not provider["dedicated"]:

@@ -5,18 +5,46 @@ clients the same STUN/TURN configuration. Deploy it behind a stable HTTPS/WSS
 hostname; a temporary tunnel hostname is not suitable for recording sessions.
 
 A port of the Node.js implementation onto Python + aiohttp, since extended to
-protocol 3. Message validation, resume behaviour and TURN configuration are
+protocol 4. Message validation, resume behaviour and TURN configuration are
 unchanged from the Node server; the room model, the accepted media and the set
-of relayed messages are not — see **Protocol 3** below.
+of relayed messages are not — see **Protocol 4** below.
 
-## Protocol 3
+## Protocol 4
 
-| | Protocol 2 | Protocol 3 |
-| --- | --- | --- |
-| Viewers per room | one | up to `MAX_VIEWERS` (5) |
-| `session` | one per room | one per publisher↔viewer link |
-| Media | video only | video **and** audio (the glasses' microphone) |
-| Relayed messages | `offer` `answer` `candidate` `state` `tag-request` | … plus `gaze` and `viewers` |
+| | Protocol 2 | Protocol 3 | Protocol 4 |
+| --- | --- | --- | --- |
+| Viewers per room | one | up to `MAX_VIEWERS` (5) | up to `MAX_VIEWERS` (5) |
+| `session` | one per room | one per publisher↔viewer link | one per publisher↔viewer link |
+| Media | video only | video **and** audio (the glasses' microphone) | video **and** audio |
+| Relayed messages | `offer` `answer` `candidate` `state` `tag-request` | … plus `gaze` and `viewers` | … plus `access-request` and `access-response` |
+| Pairing | automatic | automatic | gated on the publisher's approval |
+
+**Access control.** No viewer is paired without the publisher explicitly
+saying so:
+
+1. A viewer connects to `/signal/<room>?role=viewer`; the server validates the
+   room name and, if a resume token is presented, the pairing information it
+   names.
+2. The viewer sends `{"type": "access-request"}`.
+3. The server relays it to the publisher as
+   `{"type": "access-request", "viewer": "<id>"}`.
+4. The Neurora user (the publisher) accepts or declines from that prompt.
+5. Only on `{"type": "access-response", "viewer": "<id>", "accepted": true}`
+   does the server mint a session and send `ready`, opening WebRTC
+   negotiation. `accepted: false` sends the viewer `access-declined` instead;
+   its WebSocket is left exactly as it was, so it can send another
+   `access-request` later.
+
+This gate applies to every new pairing, not only a first join — a viewer's own
+`restart`, a publisher-initiated one, and a stale link being picked back up
+after the publisher itself resumes all go through the same request/response
+round trip before a new session is minted. It does **not** apply to a plain
+resume of a session whose media connection never actually died (the server
+answers `resumed`, not `ready`): nothing new is being granted there, only a
+signaling socket reconnecting to a link the publisher never revoked. A
+declined or still-pending request does not hold a viewer's seat open in any
+special way; the server's normal room-full/seat-release rules apply exactly as
+they would to any other connected, unpaired viewer.
 
 **Sessions are links, not rooms.** Each viewer is paired with its own
 `session` id, and every `offer`, `answer`, `candidate` and `restart` names
@@ -81,7 +109,7 @@ Overridable before launching:
 | `MAX_VIEWERS` | `5` |
 | `PYTHON` | `py -3`, else `python` on PATH |
 | `NGROK_PATH` | `ngrok.exe` on PATH, else the usual install locations |
-| `NGROK_DOMAIN` | `district-body-stumbling.ngrok-free.dev` (the one baked into the APK) |
+| `NGROK_DOMAIN` | `cameo-showdown-puppy.ngrok-free.dev` (the one baked into the APK) |
 | `SKIP_TUNNEL=1` | unset — set it to run on localhost only |
 
 ngrok is optional: without it the server and the browser viewer still work on
@@ -190,7 +218,7 @@ everything below is a mechanical substitution that changed nothing.
 | 30s `ping`/`pong` sweep over `wss.clients` | per-socket `WebSocketResponse(heartbeat=30)` |
 | `crypto.randomUUID()` | `uuid.uuid4()` |
 | `node --env-file-if-exists=.env` | `load_dotenv()` in `main()` |
-| `node --test` (`server.test.js`) | `pytest` (`test_server.py`), 24 tests |
+| `node --test` (`server.test.js`) | `pytest` (`test_server.py`), 29 tests |
 
 Two details worth knowing:
 
