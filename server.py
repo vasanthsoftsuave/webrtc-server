@@ -788,10 +788,21 @@ def create_server(
                     f"({len(room.connected_viewers)}/{max_viewers} watching)",
                     flush=True,
                 )
-                if is_resume:
+                if is_resume and not slot.awaiting_access:
                     # The link once had the publisher's say-so and is only
                     # being picked back up - the server asks again on the
                     # viewer's behalf rather than making it re-request.
+                    #
+                    # Guarded on `awaiting_access`: a flaky viewer socket
+                    # (mobile NAT/radio rebinding) can resume here several
+                    # times while the ORIGINAL request is still outstanding
+                    # and the publisher socket hasn't changed - without this
+                    # guard, every such reconnect fired a brand new
+                    # `access-request` at the still-connected publisher,
+                    # which is what made the capture app see the same
+                    # participant's request pop up repeatedly. The publisher
+                    # already has the one request live; resuming the
+                    # viewer's socket doesn't invalidate it.
                     await request_access(room, slot)
                 # A genuinely fresh viewer has asked for nothing yet: wait
                 # for its own explicit `access-request` (see
